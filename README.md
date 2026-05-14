@@ -1,6 +1,4 @@
 
-  <title>Pushover Notification Service</title>
-
 
 <body style="" lang="EN-US" link="blue" vlink="purple">
 
