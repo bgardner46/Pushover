@@ -1,0 +1,484 @@
+# PushOver plug-in - Bob Gardner
+#
+# Version: 0.6?
+# $Revision: 1.9 $
+# $Date: 2026/04/15 01:18:19 $
+
+hvImport debug
+hvPublic processmsg
+
+package require http
+package require tls
+::http::register https 443 [list ::tls::socket -tls1 1 -autoservername 1]
+
+#! Plugin directory location
+set script [file normalize [file join [pwd] [info script]]]
+set dir [file dirname $script]
+set cfgfileroot [file tail [file rootname [info script]]]
+lappend auto_path $dir
+tcl::tm::path add $dir
+
+set logsuspend 0
+
+array set cfg {
+    serPre      "pushover:"
+    serPost     ";"
+    geometry    ""
+    apikey ""
+    userkey ""
+    listWidths  {0 0 0}
+    logging     0
+    logpath     ""
+}
+set cfg(txtext) [expr {$tcl_platform(platform) eq "windows" ? ".txt" : ""}]
+
+#
+# pushover is called by other plugins to communicate with The Pushover Service https://pushover.net/.
+#
+#    pushover { -t {title} | -p {priority} | -d {device1,device2} | -s {sound} | -ttl {seconds} | -l } message
+#
+# -t {title}: Title for message. If title is more than one word, enclose in double quotes or braces.
+# -p {priority}: Priority of message. A value of -2, -1, 0 (default), 1, or 2{,r{,e}}.
+#                For priority 2, r = retry time (default: 60, min: 30), e = expire time (default: 1800, max: 10800)
+# -d {device(s)}: list of devices to send to, comma separated if more then one. Default: all devices.
+# -s {sound}: Notification sound. Default: "echo".
+# -ttl {seconds}: Time to live, after which the message will be deleted. Default: Device behavior for notifications.
+# -l: log this command to Pushover log.
+# message: Message to send. Must come after all options. Does not need to be enclosed in quotes.
+#
+#  Invalid options, along with any other options that follow, will be interpreted as part of the message.
+# 
+# Examples:
+#
+#  Send a message with default parameters (typical use).
+#    pushover Hello World! 
+#  Send a message to specific devices and log:
+#     pushover -l -d bobsphone,wphone Hello World
+#  Send a message with emergency priority every 30 secs for 15 mins and log:
+#     pushover -l -p 2,30,900 Water Leak Detected in Utility Room!
+#  Send a message with emergency priority every 45 secs for 30 mins and log:
+#     pushover -l -p 2,45 Water Leak Detected in Utility Room!
+#
+hvPublic pushover
+proc pushover {args} {
+    global cfg
+
+    set sound "echo"
+    set log 0
+    set retry 60
+    set expire 10800
+
+    set nargs $args
+    set qlist [list token $cfg(apikey) user $cfg(userkey)]
+    while 1 {
+        if {[lindex $nargs 0] eq "-l"} {
+            set log 1
+            set nargs [lrange $nargs 1 end]
+            continue
+        }
+        if {[lindex $nargs 0] eq "-t"} {
+            lappend qlist title [lindex $nargs 1]
+            set nargs [lrange $nargs 2 end]
+            continue
+        }
+        if {[lindex $nargs 0] eq "-p"} {
+            set pri [split [lindex $nargs 1] ","]
+            lappend qlist priority [lindex $pri 0]
+            if {[lindex $pri 0] == 2} {
+                if {[lindex $pri 1] ne {} && [lindex $pri 1] >= 30} {
+                    set retry [lindex $pri 1]
+                    if {[lindex $pri 2] ne {} && [lindex $pri 2] <= 10800} {
+                        set expire [lindex $pri 2]
+                    }
+                }
+                lappend qlist retry $retry expire $expire
+            }
+            set nargs [lrange $nargs 2 end]
+            continue
+        }
+        if {[lindex $nargs 0] eq "-ttl"} {
+            lappend qlist ttl [lindex $nargs 1]
+            set nargs [lrange $nargs 2 end]
+            continue
+        }
+        if {[lindex $nargs 0] eq "-d"} {
+            lappend qlist devices [lindex $nargs 1]
+            set nargs [lrange $nargs 2 end]
+            continue
+        }
+        if {[lindex $nargs 0] eq "-s"} {
+            set sound [lindex $nargs 1]
+            set nargs [lrange $nargs 2 end]
+            continue
+        }
+        break
+    }
+
+    if {[llength $nargs] == 0} {
+        # no message!
+        return
+    }
+
+    lappend qlist sound $sound message [join $nargs]
+
+    set msgquery [http::formatQuery {*}$qlist]
+    debug "query= $msgquery"
+
+    set link "https://api.pushover.net/1/messages.json"
+    catch {set token [http::geturl $link -query $msgquery -command httpCallback]}
+    if {$log != 0 } {
+        pushoverLog $qlist
+    }
+}
+
+# Process serial message
+proc processmsg str {
+	global msg cfg
+	debug $str
+	if {[regexp -nocase [format {%1$s +([^%2$s]+)%2$s} $cfg(serPre) $cfg(serPost)] $str match msg]} {
+		debug "String: $str"
+		debug "Match: $match"
+		debug "Message: $msg"
+		pushover {*}$msg
+		set myreturn [string length $match]
+		debug "Return:  $myreturn"
+		return $myreturn
+	} else {
+		#debug "Failed"
+		return 0
+	}
+}
+# Come here after connecting to web site to retrieve and parse data
+proc httpCallback {token} {
+
+	#get return data
+	set returndata [http::data $token]
+	debug "Data Point: $returndata"
+
+	http::cleanup $token
+}
+
+# Start Config Section
+
+# Get the config info from cfg file
+proc loadConfig {} {
+    global cfgfile cfgfileroot cfg
+
+debug "loadConfig!" blue
+    package require Mk4tcl
+
+    set suffix [hvVariable ApplicationSuffix]
+    if {$suffix eq ""} {
+        set cfgfile $cfgfileroot.cfg
+    } else {
+        set cfgfile $cfgfileroot-$suffix.cfg
+    }
+
+    mk::file open cfg
+    if {![catch {hvConfigFile open $cfgfile} f]} {
+        mk::file load cfg $f
+        close $f
+    }
+
+    # General settings
+    mk::view layout cfg.main {
+        name value
+    }
+
+    if {[catch {hvConfig Geometry} geometry]} {
+        set geometry ""
+    }
+
+    set cfg(version) 1
+    # update config
+    mk::loop row cfg.main {
+        array set cfg [mk::get $row name value]
+    }
+
+    set saveflag 0
+
+    debug "Config Version: $cfg(version)" green
+
+    # set any missing cfg items into cfg.main
+    foreach {var val} [array get cfg] {
+        if {[mk::select cfg.main name $var] == ""} {
+            mk::row append cfg.main name $var value $val
+            set saveflag 1
+        }
+    }
+    if {$saveflag} {saveconfig}
+}
+
+proc cfg_done {} {
+    global cfg currentItem
+
+    mk::loop row cfg.main {
+        array set tmpcfg [mk::get $row name value]
+    }
+   debug [array get tmpcfg] blue
+
+    if {$tmpcfg(serPre) ne $cfg(serPre)} {
+        hvTrigger $tmpcfg(serPre) {}
+        hvTrigger $cfg(serPre) [list processmsg]
+    }
+
+    saveconfig
+
+    set currentItem ""
+    destroy .pushover
+}
+
+# Save config changes to cfg file
+proc saveconfig {{top ""}} {
+    global cfg cfgfile
+
+    if {[winfo exists .pushover]} {
+        set cfg(geometry) [wm geometry .pushover]
+    }
+    mk::view size cfg.main 0
+    foreach {var val} [array get cfg] {
+        mk::row append cfg.main name $var value $val
+    }
+    set bkup pushover-[pid].$$$
+    set rc [catch {hvConfigFile create $bkup w} f]
+    debug "rc:$rc;f:$f" red
+
+    mk::loop row cfg.main {
+        debug [mk::get $row name value] red
+    }
+
+    if {$rc == 0} {
+        mk::file save cfg $f
+        close $f
+        hvConfigFile delete $cfgfile
+        hvConfigFile rename $bkup $cfgfile
+    } elseif {$top ne ""} {
+        ttk::messageBox -parent $top -message $f -icon error -type ok
+    } else {
+        debug "Failed to save configuration: $f"
+    }
+    return [expr {!$rc}]
+}
+
+# Pushover configuration screen
+proc configure {} {
+    global cfg
+
+    if {[winfo exists .pushover]} {
+        wm withdraw .pushover
+        wm deiconify .pushover
+        return
+    }
+    ttk::toplevel .pushover
+    wm withdraw .pushover
+    wm title .pushover "Pushover Configuration"
+
+    ttk::notebook .pushover.nb
+    # Settings Tab
+    ttk::frame .pushover.nb.f2
+
+    ttk::label .pushover.nb.f2.l15 -text "API Key:" -anchor e
+    ttk::entry .pushover.nb.f2.e15 -width 32 -justify center -textvariable cfg(apikey)
+    ttk::label .pushover.nb.f2.l16 -text "User Key:" -anchor e
+    ttk::entry .pushover.nb.f2.e16 -width 32 -justify center -textvariable cfg(userkey)
+
+    ttk::checkbutton .pushover.nb.f2.c31 -variable cfg(logging) -text "Create log file" -command cfg_logsel
+    ttk::label .pushover.nb.f2.l31 -text "Log Folder:" -anchor e
+    ttk::entry .pushover.nb.f2.e31  -textvariable cfg(logpath)
+    ttk::button .pushover.nb.f2.b31 -width 0 -text "..." -command [list sel_directory .pushover cfg(logpath)]
+    ttk::label .pushover.nb.f2.l33 -text "Log File Extension:" -anchor e
+    ttk::entry .pushover.nb.f2.e33 -textvariable cfg(txtext)
+
+    ttk::separator .pushover.nb.f2.sep
+
+    ttk::label .pushover.nb.f2.l10 -text "Serial prefix string:" -anchor e
+    ttk::entry .pushover.nb.f2.e10 -width 10 -justify center -textvariable cfg(serPre)
+    ttk::label .pushover.nb.f2.l11 -text "Serial terminator character(s):" -anchor e
+    ttk::entry .pushover.nb.f2.e11 -width 5 -justify center -textvariable cfg(serPost)
+
+    grid .pushover.nb.f2.l15 .pushover.nb.f2.e15 -sticky nws -padx 3
+    grid configure .pushover.nb.f2.l15     -sticky nes -padx 3
+    grid .pushover.nb.f2.l16 .pushover.nb.f2.e16 -sticky nws -padx 3
+    grid configure .pushover.nb.f2.l16     -sticky nes -padx 3
+
+    grid x .pushover.nb.f2.c31 -sticky nws  -padx 3 -pady 1
+    grid .pushover.nb.f2.l31 .pushover.nb.f2.e31 .pushover.nb.f2.b31 -sticky we -padx 3
+    grid .pushover.nb.f2.l33 .pushover.nb.f2.e33 -sticky we -padx 3
+
+    grid .pushover.nb.f2.sep -column 0 -columnspan 2 -sticky ew -padx 3 -pady 3
+
+    grid .pushover.nb.f2.l10 .pushover.nb.f2.e10 -sticky nws -padx 3
+    grid configure .pushover.nb.f2.l10     -sticky nes -padx 3
+    grid .pushover.nb.f2.l11 .pushover.nb.f2.e11 -sticky nws -padx 3
+    grid configure .pushover.nb.f2.l11     -sticky nes -padx 3
+
+    grid rowconfigure .pushover.nb.f2 all -weight 1
+    grid columnconfigure .pushover.nb.f2 all -weight 1
+    grid .pushover.nb.f2 -sticky news  -padx 5 -pady 5
+
+if {0} {
+    # Save changes to column widths. Use unmapped dummy widget to
+    #  capture values before the treeview widget itself is destroyed.
+    ttk::label .pushover.nb.f2.canary
+    bind .pushover.nb.f2.canary <Destroy> bindWidths
+
+    if {[llength [lindex $cfg(listWidths) 0]] == 5} {
+        foreach col {#0 #1 #2 #3 #4} wid [lindex $cfg(listWidths) 0] {
+            .pushover.nb.f2.lb.l column $col -width $wid
+        }
+    }
+}
+    .pushover.nb add .pushover.nb.f2 -text "Settings" -underline 0
+    grid .pushover.nb    -sticky snew    -padx 5 -pady 5 -columnspan 3
+
+    ttk::button .pushover.b3 -text Done -width 8 -command cfg_done \
+        -image [imglist ok] -compound left
+    grid  .pushover.b3  -columnspan 3 -padx {4 13} -pady {2 8}
+    grid columnconfigure .pushover all -weight 1
+    grid rowconfigure .pushover .pushover.nb -weight 1
+    grid rowconfigure .pushover .pushover.b3 -weight 0
+    bind .pushover <F1> {hvHelp index}
+    bind .pushover <<NotebookTabChanged>> bindTabs
+
+    if {[lindex $cfg(listWidths) 1] ne ""} {
+        .pushover.nb select [lindex $cfg(listWidths) 1]
+    }
+
+    wm protocol .pushover WM_DELETE_WINDOW {.pushover.b3 invoke}
+
+    if {[regexp {\+-?[0-9]+\+-?[0-9]+} $cfg(geometry)]} {
+        wm geometry .pushover $cfg(geometry)
+    }
+    wm deiconify .pushover
+}
+
+proc bindTabs {} {
+    global cfg
+    lset cfg(listWidths) 1 [.pushover.nb index current]
+}
+
+# Get images for Configuration dialog
+proc imglist {i} {
+    global img
+
+    if {![info exists img($i)]} {
+        set img($i) [image create photo \
+            -file [file join [hvVariable ImagePath] $i.png]]
+        set img([format %sdim $i]) [image create photo -format {png -alpha 0.3} \
+            -file [file join [hvVariable ImagePath] $i.png]]
+    }
+    set dim $img([format %sdim $i])
+    return [list $img($i) disabled $dim]
+}
+
+proc cfg_logsel {} {
+    global cfg
+
+    if {$cfg(logging)} {
+         grid .pushover.nb.f2.l31 .pushover.nb.f2.e31 .pushover.nb.f2.b31 -sticky we -padx 3
+         grid .pushover.nb.f2.l33 .pushover.nb.f2.e33 -sticky we -padx 3
+    } else {
+        grid remove .pushover.nb.f2.l31 .pushover.nb.f2.e31 .pushover.nb.f2.b31
+        grid remove .pushover.nb.f2.l33 .pushover.nb.f2.e33
+    }
+}
+
+proc sel_directory {top name} {
+    upvar #0 $name var
+
+    set dir [ttk::chooseDirectory -initialdir $var -mustexist 1 \
+      -parent $top -title "Select directory"]
+    if {$dir ne ""} {set var $dir}
+}
+
+#! Write status information to log file
+proc pushoverLog {str {color red}} {
+    global loghandle pushoverLogdate cfg logsuspend dir
+
+    debug $str $color
+    if {!$cfg(logging) || $logsuspend == 2} return
+    set time [clock seconds]
+    set date [clock format $time -format %y%m%d]
+    if {![info exists loghandle] || $date ne $pushoverLogdate} {
+        if {[info exists loghandle]} {
+            catch {close $loghandle}
+        }
+        set t 0
+        foreach logpath [list $cfg(logpath) [file join $dir log]] {
+            if {[catch {file mkdir $logpath}]} {
+                debug "Failed to access Pushover log directory,$logpath" red
+                incr t
+                continue
+            }
+            set file [file join $logpath PushoverLog$date$cfg(txtext)]
+            if {[catch {open $file a} loghandle]} {
+                unset loghandle
+                debug "Failed to open Pushover log file,$file" red
+                incr t
+                continue
+            }
+            set pushoverLogdate $date
+            break
+        }
+        set logsuspend $t
+        if {$t >= 2} {
+            debug "Suspend logging for 5 mins" red
+            after 300000 restorelogging
+            return 0
+        }
+    } elseif {[info exists loghandle] && $logsuspend == 1} {
+        #retry orig logpath
+        set logpath $cfg(logpath)
+        if {[catch {file mkdir $logpath}]} {
+            # Failed orig logpath, keep alternate
+        } else {
+            # Found orig, try a file
+            set file [file join $logpath PushoverLog$date$cfg(txtext)]
+            if {[catch {open $file a} lh]} {
+                # Failed orig log file, keep alternate
+                unset lh
+                debug "Failed to open Pushover log file,$file" red
+            } else {
+                debug "Reopened original log file,$file" blue
+                if {[info exists loghandle]} {
+                    catch {close $loghandle}
+                }
+                set loghandle $lh
+                set logsuspend 0
+                set pushoverLogdate $date
+            }
+        }
+    }
+    catch {puts -nonewline $loghandle "[clock format $time -format "%d.%m.%Y %H.%M.%S"]\t$str\n"}
+    catch {flush $loghandle}
+    return 1
+}
+
+proc restorelogging {} {
+    global logsuspend
+
+    #after timeout, try again to log next time.
+    set logsuspend 0
+}
+
+proc init {} {
+    global cfg
+
+    debug "Init!" blue
+    loadConfig
+    hvTrigger "$cfg(serPre)" [list processmsg]
+}
+
+if {[hvGuiInit]} {
+	hvMenu [hvMainMenu Main.plugins Plugins] add command -label "Pushover" -command configure
+
+    if {[hvHelpFile pushover.hlp]} {
+        hvMenu [hvMainMenu Help.plugins Plugins] add command \
+          -label "Pushover" -command [list hvHelp pushover]
+    }
+ 
+ # Translate Enter to Return
+    bind all <Key-KP_Enter> {event generate %W <Key-Return>}
+}
+
+hvEventHook ready init
