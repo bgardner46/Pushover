@@ -2,7 +2,7 @@
 
 <body style="" lang="EN-US" link="blue" vlink="purple">
 
-<font color="<br>0000ff" size="12"><b>Pushover Notification Service</b></font>
+<font color="<br>0000ff" size="12"><b><h1>Pushover Notification Service</h1></b></font>
 <p>
 <br>The pushover plug-in provides notification service by communicating with the <a href="https://pushover.net">Pushover Service (https://pushover.net)</a>.
 <p>
